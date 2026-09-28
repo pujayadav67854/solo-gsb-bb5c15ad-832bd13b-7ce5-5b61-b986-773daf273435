@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -10,7 +11,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from . import services
+from . import sampling, services
 from .database import CaseState, SessionLocal, init_db, to_utc
 from .excursions import Thresholds
 from .propagation import PropagationParamsError, normalize_time_params
@@ -603,7 +604,12 @@ def get_sampling_coverage(
         ..., description="结束时间（含），ISO8601；生成的时隙不晚于该时刻"
     ),
     period_seconds: float = Query(
-        ..., gt=0.0, description="采样周期（秒，必须为正）"
+        ...,
+        gt=0.0,
+        description=(
+            "采样周期（秒，必须为正）：按四舍五入量化为整数微秒，"
+            "不足 1 微秒或应采时隙超过 100000 个均返回 422"
+        ),
     ),
     tolerance_seconds: float = Query(
         ...,
@@ -616,13 +622,48 @@ def get_sampling_coverage(
     end_utc = _parse_ts(end)
     if start_utc > end_utc:
         raise HTTPException(status_code=422, detail="start 不能晚于 end")
-    if tolerance_seconds >= period_seconds:
+
+    # 周期统一量化为可表示的整数微秒；不足 1 微秒（含非有限值）判 422
+    try:
+        period_us = sampling.normalize_period(period_seconds)
+    except sampling.SamplingParamsError as exc:
+        raise HTTPException(status_code=422, detail=exc.message)
+
+    # 容差在整数微秒域量化后与周期比较，避免极大值构造 timedelta 时溢出
+    if not isinstance(tolerance_seconds, (int, float)) or not math.isfinite(
+        tolerance_seconds
+    ) or tolerance_seconds < 0:
+        raise HTTPException(status_code=422, detail="tolerance_seconds 不能为负")
+    tolerance_us = max(0, round(tolerance_seconds * 1_000_000))
+    if tolerance_us >= period_us:
         raise HTTPException(
             status_code=422, detail="tolerance_seconds 必须小于 period_seconds"
         )
+    tolerance = sampling.make_tolerance(tolerance_seconds)
 
+    # 先按查询窗口计算时隙数量：超过 100000 个判 422；
+    # 周期大于窗口时只规划起点时隙，不做越界时间运算
+    try:
+        sampling.plan_slot_count(start_utc, end_utc, period_us)
+    except sampling.SamplingParamsError as exc:
+        detail: dict[str, object] = {"message": exc.message, "parameter": exc.parameter}
+        if exc.limit is not None:
+            detail["limit"] = exc.limit
+        if exc.actual is not None:
+            detail["actual"] = exc.actual
+        raise HTTPException(status_code=422, detail=detail)
+
+    effective_period_seconds = period_us / 1_000_000
+    effective_tolerance_seconds = tolerance_us / 1_000_000
     out = services.build_case_sampling_coverage(
-        db, device_sn, start_utc, end_utc, period_seconds, tolerance_seconds
+        db,
+        device_sn,
+        start_utc,
+        end_utc,
+        period_us,
+        effective_period_seconds,
+        tolerance,
+        effective_tolerance_seconds,
     )
     if out is None:
         raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")

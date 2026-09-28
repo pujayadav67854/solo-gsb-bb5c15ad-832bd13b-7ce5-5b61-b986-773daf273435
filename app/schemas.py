@@ -452,12 +452,15 @@ class SamplingCoverageOut(BaseModel):
     end: dt.datetime = Field(
         ..., description="实际生效的结束时间（UTC）：时隙不晚于该时刻"
     )
-    period_seconds: float = Field(..., description="采样周期（秒）")
+    period_seconds: float = Field(
+        ..., description="生效采样周期（秒）：入参周期四舍五入量化后的整数微秒数 / 1e6"
+    )
     tolerance_seconds: float = Field(
-        ..., description="匹配容差（秒）：|读数时刻 − 时隙| ≤ 该值（含等于）可覆盖"
+        ..., description="生效匹配容差（秒）：|读数时刻 − 时隙| ≤ 该值（含等于）可覆盖"
     )
     expected_count: int = Field(
-        ..., description="应采时隙数：起点为首个，按周期生成不晚于终点的时隙"
+        ...,
+        description="应采时隙数（≤ 100000）：起点为首个，先按窗口算数，按整数微秒周期生成不晚于终点的时隙",
     )
     covered_count: int = Field(..., description="已覆盖时隙数（一对一匹配）")
     coverage: float = Field(..., description="覆盖率 = covered_count / expected_count")

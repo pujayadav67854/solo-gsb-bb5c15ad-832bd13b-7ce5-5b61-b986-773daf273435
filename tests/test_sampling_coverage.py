@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 
 os.environ["CASE_DB_URL"] = "sqlite:///:memory:"
@@ -281,6 +282,120 @@ def test_422_invalid_period_and_tolerance(client):
                      tolerance_seconds=601).status_code == 422
     # 缺必填参数
     assert client.get("/api/v1/cases/CASE-S13/sampling-coverage").status_code == 422
+
+
+# ---------- 周期量化为整数微秒 & 时隙数量边界 ----------
+
+
+def test_422_sub_microsecond_period(client):
+    _post(client, [_reading("CASE-S15", "2026-09-01T00:00:00Z")])
+    base = {"start": "2026-09-01T00:00:00Z", "end": "2026-09-01T00:00:01Z"}
+    # 不足 1 微秒的周期（量化后为 0 微秒）一律 422，不再生成重复微秒时隙
+    for p in (0.0000004, 0.000000499999, 5e-7):
+        r = _coverage(client, "CASE-S15", **base,
+                      period_seconds=p, tolerance_seconds=0)
+        assert r.status_code == 422, (p, r.status_code, r.text)
+
+
+def test_period_quantized_to_integer_microseconds(client):
+    # 0.0000015 四舍五入为 2µs；窗口 10µs → 时隙 0/2/4/6/8/10 共 6 个，
+    # 不再出现浮点累加导致的重复微秒时隙
+    _post(client, [
+        _reading("CASE-S16", f"2026-09-01T00:00:00.{i:06d}Z")
+        for i in range(0, 11, 2)
+    ])
+    r = _coverage(
+        client, "CASE-S16",
+        start="2026-09-01T00:00:00.000000Z",
+        end="2026-09-01T00:00:00.000010Z",
+        period_seconds=0.0000015, tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["period_seconds"] == 0.000002
+    assert body["expected_count"] == 6
+    assert body["covered_count"] == 6
+    assert body["gaps"] == []
+
+
+def test_sub_microsecond_period_no_duplicate_slots_unit():
+    # 单元层：0.4µs 周期在旧实现下会产出数百万重复微秒时隙；
+    # 新实现先算数，且该周期在接口层即判 422（normalize 抛错）
+    from app.sampling import SamplingParamsError, generate_slots, normalize_period
+
+    with pytest.raises(SamplingParamsError):
+        normalize_period(0.0000004)
+
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+    end = start + dt.timedelta(seconds=1)
+    # 1µs 周期：1 秒窗口恰好 1000001 个 → 超 100000 上限
+    with pytest.raises(SamplingParamsError):
+        generate_slots(start, end, 1)
+    # 2µs 周期、0.1 秒窗口：50001 个时隙且全部唯一（整数微秒，无重复）
+    short_end = start + dt.timedelta(microseconds=100_000)
+    slots = generate_slots(start, short_end, 2)
+    assert len(slots) == 50001
+    assert len(set(slots)) == len(slots)
+
+
+def test_period_larger_than_window_single_slot_no_overflow(client):
+    # 极大正周期（远超 timedelta 可表示范围）+ 更短查询窗：
+    # 只生成起点时隙，不试算下一个时隙，旧实现会 OverflowError → 500
+    _post(client, [_reading("CASE-S17", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S17", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T01:00:00Z", period_seconds=1e300, tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_count"] == 1
+    assert body["covered_count"] == 1
+    assert body["coverage"] == pytest.approx(1.0)
+    assert body["gaps"] == []
+
+
+def test_period_larger_than_window_reading_outside_tolerance(client):
+    # 周期大于窗口：起点时隙仍按容差窗口匹配，容差外读数不覆盖
+    _post(client, [_reading("CASE-S18", "2026-09-01T00:05:00Z")])
+    r = _coverage(
+        client, "CASE-S18", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T01:00:00Z", period_seconds=100000,
+        tolerance_seconds=60,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_count"] == 1
+    assert body["covered_count"] == 0
+    assert body["gaps"] == [
+        {"start_ts": "2026-09-01T00:00:00Z",
+         "end_ts": "2026-09-01T00:00:00Z", "missing_slots": 1}
+    ]
+
+
+def test_422_expected_slots_over_limit(client):
+    _post(client, [_reading("CASE-S19", "2026-09-01T00:00:00Z")])
+    # 1µs 周期、1 秒窗口 → 1000001 个时隙，超过 100000 上限 → 422
+    r = _coverage(
+        client, "CASE-S19", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:01Z", period_seconds=0.000001,
+        tolerance_seconds=0,
+    )
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["limit"] == 100000
+    assert detail["actual"] == 1000001
+
+
+def test_expected_slots_at_limit_accepted(client):
+    # 窗口 99999µs、周期 1µs → 恰好 100000 个时隙，边界值接受
+    _post(client, [_reading("CASE-S20", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S20", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:00.099999Z", period_seconds=0.000001,
+        tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["expected_count"] == 100000
 
 
 # ---------- 只读 & 确定性 ----------
