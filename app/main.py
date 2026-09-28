@@ -15,6 +15,7 @@ from .database import CaseState, SessionLocal, init_db, to_utc
 from .excursions import Thresholds
 from .propagation import PropagationParamsError, normalize_time_params
 from .recovery import InsufficientBaselineSamples
+from .sampling import SamplingParamsError, resolve_sampling_params
 from .schemas import (
     AnchorIn,
     AnchorOut,
@@ -99,6 +100,17 @@ def _parse_ts(value: dt.datetime | None) -> dt.datetime | None:
 
 def _propagation_params_422(exc: PropagationParamsError) -> HTTPException:
     detail: dict[str, object] = {"message": str(exc), "parameter": exc.parameter}
+    if exc.limit is not None:
+        detail["limit"] = exc.limit
+    if exc.actual is not None:
+        detail["actual"] = exc.actual
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+    )
+
+
+def _sampling_params_422(exc: SamplingParamsError) -> HTTPException:
+    detail: dict[str, object] = {"message": exc.message, "parameter": exc.parameter}
     if exc.limit is not None:
         detail["limit"] = exc.limit
     if exc.actual is not None:
@@ -603,26 +615,36 @@ def get_sampling_coverage(
         ..., description="结束时间（含），ISO8601；生成的时隙不晚于该时刻"
     ),
     period_seconds: float = Query(
-        ..., gt=0.0, description="采样周期（秒，必须为正）"
+        ...,
+        gt=0.0,
+        description=(
+            "采样周期（秒，必须为正）：四舍五入到整数微秒后生效，"
+            "不足 1 微秒返回 422；周期大于查询窗口时只生成起点时隙"
+        ),
     ),
     tolerance_seconds: float = Query(
         ...,
         ge=0.0,
-        description="匹配容差（秒）：0 ≤ 容差 < 周期；|读数时刻 − 时隙| ≤ 容差（含等于）即可覆盖",
+        description=(
+            "匹配容差（秒）：四舍五入到整数微秒后生效，"
+            "0 ≤ 容差 < 周期；|读数时刻 − 时隙| ≤ 容差（含等于）即可覆盖"
+        ),
     ),
     db: Session = Depends(get_db),
 ):
     start_utc = _parse_ts(start)
     end_utc = _parse_ts(end)
-    if start_utc > end_utc:
-        raise HTTPException(status_code=422, detail="start 不能晚于 end")
-    if tolerance_seconds >= period_seconds:
-        raise HTTPException(
-            status_code=422, detail="tolerance_seconds 必须小于 period_seconds"
+    try:
+        # 先统一为整数微秒并按窗口预估时隙数量（≤ 100000），
+        # 全部校验在此完成，不依赖设备是否存在
+        resolved = resolve_sampling_params(
+            start_utc, end_utc, period_seconds, tolerance_seconds
         )
+    except SamplingParamsError as exc:
+        raise _sampling_params_422(exc) from None
 
     out = services.build_case_sampling_coverage(
-        db, device_sn, start_utc, end_utc, period_seconds, tolerance_seconds
+        db, device_sn, start_utc, end_utc, resolved
     )
     if out is None:
         raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")

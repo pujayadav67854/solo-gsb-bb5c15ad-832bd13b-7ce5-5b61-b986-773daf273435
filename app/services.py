@@ -858,13 +858,13 @@ def build_case_sampling_coverage(
     device_sn: str,
     start: dt.datetime,
     end: dt.datetime,
-    period_seconds: float,
-    tolerance_seconds: float,
+    resolved: samp.ResolvedSamplingParams,
 ) -> SamplingCoverageOut | None:
     """周期时隙采样覆盖率与连续缺测缺口（只读计算，不落库）。
 
-    设备没有任何读数时返回 ``None``（由上层判 404）。时隙生成、
-    容差扩展范围过滤与一对一贪心匹配全部委托 :mod:`app.sampling`。
+    设备没有任何读数时返回 ``None``（由上层判 404）。入参校验、微秒
+    归一化与时隙数量预估均已由 :func:`samp.resolve_sampling_params`
+    完成；容差扩展范围过滤与一对一贪心匹配委托 :mod:`app.sampling`。
     """
     samples = _load_samples(db, device_sn)
     if not samples:
@@ -874,15 +874,14 @@ def build_case_sampling_coverage(
         samples,
         start=start,
         end=end,
-        period_seconds=period_seconds,
-        tolerance_seconds=tolerance_seconds,
+        resolved=resolved,
     )
     return SamplingCoverageOut(
         device_sn=device_sn,
         start=start,
         end=end,
-        period_seconds=period_seconds,
-        tolerance_seconds=tolerance_seconds,
+        period_seconds=resolved.period_effective_seconds,
+        tolerance_seconds=resolved.tolerance_effective_seconds,
         expected_count=result.expected_count,
         covered_count=result.covered_count,
         coverage=result.coverage,

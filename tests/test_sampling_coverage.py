@@ -283,6 +283,224 @@ def test_422_invalid_period_and_tolerance(client):
     assert client.get("/api/v1/cases/CASE-S13/sampling-coverage").status_code == 422
 
 
+# ---------- 周期边界：整数微秒归一化 ----------
+
+
+def test_422_sub_microsecond_period(client):
+    # 0.0000004 秒四舍五入到整数微秒为 0：旧实现会生成重复微秒时隙，
+    # 虚增应采数与缺口；现在直接 422
+    _post(client, [_reading("CASE-S20", "2026-09-01T00:00:00Z")])
+    base = {"start": "2026-09-01T00:00:00Z", "end": "2026-09-01T01:00:00Z",
+            "tolerance_seconds": 0}
+    r = _coverage(client, "CASE-S20", **base, period_seconds=0.0000004)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["parameter"] == "period_seconds"
+    assert "微秒" in detail["message"]
+    # 远小于半微秒同样 422
+    assert _coverage(client, "CASE-S20", **base,
+                     period_seconds=1e-12).status_code == 422
+
+
+def test_one_microsecond_period_slots_are_unique(client):
+    # 1 微秒周期、99 微秒窗口 → 100 个互不重复的时隙，起点读数覆盖第 1 个
+    _post(client, [_reading("CASE-S21", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S21", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:00.000099Z",
+        period_seconds=0.000001, tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["period_seconds"] == 1e-6
+    assert body["expected_count"] == 100
+    assert body["covered_count"] == 1
+    assert body["gap_count"] == 1
+    gap = body["gaps"][0]
+    # 连续 99 个缺测微秒时隙合并为一个缺口，不出现重复时刻
+    assert gap["missing_slots"] == 99
+    assert gap["start_ts"] == "2026-09-01T00:00:00.000001Z"
+    assert gap["end_ts"] == "2026-09-01T00:00:00.000099Z"
+
+
+def test_period_normalized_to_effective_microseconds(client):
+    # 非整数微秒的周期按四舍五入生效（0.6µs → 1µs），回显生效周期
+    _post(client, [_reading("CASE-S22", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S22", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:00.000002Z",
+        period_seconds=0.0000006, tolerance_seconds=0,
+    )
+    body = r.json()
+    assert body["period_seconds"] == 1e-6
+    assert body["expected_count"] == 3  # 0 / 1 / 2 微秒
+
+
+def test_422_tolerance_equals_period_after_rounding(client):
+    # 原值上容差 < 周期，但取整到微秒后两者相等 → 仍 422
+    _post(client, [_reading("CASE-S23", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S23", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:10:00Z",
+        period_seconds=1.0000004, tolerance_seconds=1.0000002,
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["parameter"] == "tolerance_seconds"
+
+
+# ---------- 周期大于窗口 / 极大周期 ----------
+
+
+def test_period_longer_than_window_emits_only_start_slot(client):
+    # 周期 3601s > 3600s 窗口：只生成起点时隙，正常 200，不做越界运算
+    _post(client, [_reading("CASE-S24", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S24", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T01:00:00Z", period_seconds=3601, tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_count"] == 1
+    assert body["covered_count"] == 1
+    assert body["gaps"] == []
+
+
+def test_huge_positive_period_returns_200_not_500(client):
+    # 旧实现试算 start + 1e100 秒时 timedelta 溢出 → 500；
+    # 现在周期大于窗口只生成起点时隙，返回 200
+    _post(client, [
+        _reading("CASE-S25", "2026-09-01T00:00:30Z"),
+        _reading("CASE-S25", "2026-09-01T00:02:01Z"),
+    ])
+    base = {"start": "2026-09-01T00:00:00Z", "end": "2026-09-01T01:00:00Z"}
+    r = _coverage(client, "CASE-S25", **base,
+                  period_seconds=1e100, tolerance_seconds=60)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_count"] == 1
+    # 00:00:30 在 60s 容差内覆盖起点；00:02:01 超容差，一对一匹配后仍只 1 个
+    assert body["covered_count"] == 1
+    assert body["gaps"] == []
+    # 极大但仍在数值量级内的周期同样安全
+    r2 = _coverage(client, "CASE-S25", **base,
+                   period_seconds=1e30, tolerance_seconds=60)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["expected_count"] == 1
+
+
+def test_huge_period_with_huge_tolerance_covers_far_reading(client):
+    # 周期与容差都大到时间位移不可表示：起点时隙按饱和窗口覆盖全部读数
+    _post(client, [_reading("CASE-S26", "2026-09-30T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S26", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T01:00:00Z", period_seconds=1e100, tolerance_seconds=1e90,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["expected_count"] == 1
+    assert body["covered_count"] == 1
+
+
+# ---------- 应采时隙数上限 100000 ----------
+
+
+def test_expected_slots_at_limit_allowed(client):
+    # 跨度 99999µs、周期 1µs → 恰好 100000 个时隙，放行
+    _post(client, [_reading("CASE-S27", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S27", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:00.099999Z",
+        period_seconds=0.000001, tolerance_seconds=0,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["expected_count"] == 100000
+
+
+def test_422_expected_slots_over_limit(client):
+    # 跨度 100000µs → 100001 个时隙，超过上限 100000 → 422（先算数，不构造）
+    _post(client, [_reading("CASE-S28", "2026-09-01T00:00:00Z")])
+    r = _coverage(
+        client, "CASE-S28", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T00:00:00.100000Z",
+        period_seconds=0.000001, tolerance_seconds=0,
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["parameter"] == "expected_count"
+    assert detail["limit"] == 100000
+    assert detail["actual"] == 100001
+
+
+def test_422_over_limit_independent_of_case_existence(client):
+    # 时隙数量按查询窗口预估，超限在查库之前即 422（不存在的设备也不返回 404）
+    r = _coverage(
+        client, "NOPE-LIMIT", start="2026-09-01T00:00:00Z",
+        end="2026-09-01T01:00:00Z",
+        period_seconds=0.000001, tolerance_seconds=0,
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["parameter"] == "expected_count"
+
+
+def test_non_finite_period_and_tolerance_422(client):
+    _post(client, [_reading("CASE-S29", "2026-09-01T00:00:00Z")])
+    base = {"start": "2026-09-01T00:00:00Z", "end": "2026-09-01T01:00:00Z"}
+    assert _coverage(client, "CASE-S29", **base,
+                     period_seconds="inf", tolerance_seconds=0).status_code == 422
+    assert _coverage(client, "CASE-S29", **base,
+                     period_seconds=600, tolerance_seconds="inf").status_code == 422
+
+
+# ---------- 纯计算：生效时隙序列的确定性与一致性 ----------
+
+
+def test_unit_slots_are_integer_microseconds_and_shared():
+    import datetime as dt
+
+    from app.sampling import (
+        compute_sampling_coverage,
+        generate_slots,
+        resolve_sampling_params,
+    )
+
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+    end = start + dt.timedelta(milliseconds=1)
+    resolved = resolve_sampling_params(start, end, 0.000001, 0.0)
+    assert resolved.expected_count == 1001
+    slots = generate_slots(start, resolved)
+    # 旧实现 period_seconds=1e-6 逐次浮点累加会产生重复微秒时隙
+    assert len(slots) == 1001
+    assert len(set(slots)) == 1001
+    assert all(s.microsecond == i for i, s in enumerate(slots[:1000]))
+
+    class R:
+        def __init__(self, ts):
+            self.ts = ts
+
+    # 匹配 / 覆盖率 / 缺口共用同一时隙序列：首时隙被覆盖，其余 1000 个成一缺口
+    result = compute_sampling_coverage(
+        [R(start)], start=start, end=end, resolved=resolved
+    )
+    assert result.expected_count == 1001
+    assert result.covered_count == 1
+    assert result.gaps[0].missing_slots == 1000
+    assert result.gaps[0].start_ts == slots[1]
+    assert result.gaps[0].end_ts == slots[-1]
+
+
+def test_unit_sub_microsecond_period_rejected_before_slot_build():
+    import datetime as dt
+
+    import pytest as _pytest
+
+    from app.sampling import SamplingParamsError, resolve_sampling_params
+
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+    with _pytest.raises(SamplingParamsError) as exc:
+        resolve_sampling_params(start, start + dt.timedelta(hours=1), 4e-7, 0.0)
+    assert exc.value.parameter == "period_seconds"
+
+
 # ---------- 只读 & 确定性 ----------
 
 
